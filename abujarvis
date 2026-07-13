@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+import fcntl
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+CLAUDE = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
+SESSION = os.environ.get("ABUJARVIS_SESSION", "dev")
+ROOT = os.environ.get("ABUJARVIS_HOME", os.path.expanduser("~/.abujarvis"))
+STATE = os.path.join(ROOT, "state")
+INBOX = os.path.join(ROOT, "inbox")
+HOME = os.path.expanduser("~")
+
+STAGES = ("todo", "doing", "review", "blocked", "done")
+
+C = {"busy": "\033[33m", "idle": "\033[32m", "shell": "\033[36m",
+     "dim": "\033[2m", "bold": "\033[1m", "off": "\033[0m"}
+
+
+def color(s, key):
+    if not sys.stdout.isatty():
+        return s
+    return f"{C.get(key, '')}{s}{C['off']}"
+
+
+def tilde(p):
+    return p.replace(HOME, "~", 1) if p.startswith(HOME) else p
+
+
+def ppid_of(pid):
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                if line.startswith("PPid:"):
+                    return int(line.split()[1])
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def tmux_panes():
+    try:
+        out = subprocess.run(
+            ["tmux", "list-panes", "-s", "-t", SESSION, "-F",
+             "#{window_index}\t#{pane_pid}\t#{window_name}"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    panes = {}
+    for line in out.strip().splitlines():
+        parts = line.split("\t")
+        if len(parts) != 3:
+            continue
+        win, pane_pid, name = parts
+        try:
+            panes[int(pane_pid)] = (int(win), name)
+        except ValueError:
+            continue
+    return panes
+
+
+def window_of(pid, panes):
+    cur = pid
+    for _ in range(12):
+        cur = ppid_of(cur)
+        if not cur or cur == 1:
+            return None
+        if cur in panes:
+            return panes[cur]
+    return None
+
+
+def read_card(sid):
+    try:
+        with open(os.path.join(STATE, f"{sid}.json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def inbox_count(sid):
+    try:
+        with open(os.path.join(INBOX, f"{sid}.jsonl")) as f:
+            return len([x for x in f.read().splitlines() if x.strip()])
+    except OSError:
+        return 0
+
+
+def agents():
+    try:
+        out = subprocess.run(
+            [CLAUDE, "agents", "--json"], capture_output=True, text=True, timeout=20
+        ).stdout
+        data = json.loads(out)
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        sys.exit("abujarvis: cannot list instances (claude agents --json failed)")
+    panes = tmux_panes()
+    tabs = []
+    for a in data:
+        if not os.path.exists(f"/proc/{a.get('pid')}"):
+            continue
+        win = window_of(a["pid"], panes)
+        sid = a.get("sessionId", "")
+        card = read_card(sid)
+        tabs.append({
+            "pid": a["pid"],
+            "session_id": sid,
+            "name": a.get("name", "?"),
+            "cwd": a.get("cwd", ""),
+            "status": a.get("status", "?"),
+            "kind": a.get("kind", ""),
+            "window": win[0] if win else None,
+            "window_name": win[1] if win else None,
+            "goal": card.get("goal"),
+            "stage": card.get("stage"),
+            "blocked_by": card.get("blocked_by"),
+            "next": card.get("next"),
+            "branch": card.get("branch"),
+            "dirty_files": card.get("dirty_files"),
+            "queued": inbox_count(sid),
+        })
+    tabs.sort(key=lambda t: (t["window"] is None,
+                             t["window"] if t["window"] is not None else 0))
+    return tabs
+
+
+def resolve(tabs, ref):
+    if not ref:
+        sys.exit("abujarvis: which tab?")
+    if ref.isdigit():
+        hit = [t for t in tabs if t["window"] == int(ref)]
+        if hit:
+            return hit[0]
+    low = ref.lower()
+
+    def wname(t):
+        return (t["window_name"] or "").lower()
+
+    ladder = [
+        lambda t: wname(t) == low or t["name"].lower() == low,
+        lambda t: wname(t).startswith(low) or t["name"].lower().startswith(low),
+        lambda t: low in wname(t) or low in t["name"].lower(),
+        lambda t: low in tilde(t["cwd"]).lower(),
+    ]
+    for rung in ladder:
+        hit = [t for t in tabs if rung(t)]
+        if len(hit) == 1:
+            return hit[0]
+        if len(hit) > 1:
+            names = ", ".join(f"{t['window']}:{t['window_name'] or t['name']}" for t in hit)
+            sys.exit(f"abujarvis: '{ref}' is ambiguous — matches: {names}")
+    sys.exit(f"abujarvis: no tab matching '{ref}'")
+
+
+def cmd_ls(argv):
+    tabs = agents()
+    if "--json" in argv:
+        print(json.dumps(tabs, ensure_ascii=False, indent=2))
+        return
+    if not tabs:
+        print("no live Claude instances")
+        return
+    wname = max((len(t["window_name"] or "") for t in tabs), default=4)
+    aname = max((len(t["name"]) for t in tabs), default=4)
+    for t in tabs:
+        win = str(t["window"]) if t["window"] is not None else "-"
+        print(f"{color(win.rjust(3), 'dim')}  {color(t['status'].ljust(6), t['status'])}  "
+              f"{(t['window_name'] or '-').ljust(wname)}  "
+              f"{color(t['name'].ljust(aname), 'dim')}  {color(tilde(t['cwd']), 'dim')}")
+    busy = sum(1 for t in tabs if t["status"] == "busy")
+    print(color(f"\n{len(tabs)} tabs, {busy} working", "dim"))
+
+
+def cmd_board(argv):
+    tabs = agents()
+    if not tabs:
+        print("no live Claude instances")
+        return
+    cols = [("blocked", "BLOCKED"), ("doing", "WORKING"), ("review", "REVIEW"),
+            ("done", "DONE"), ("todo", "NO TASK")]
+    for stage, title in cols:
+        group = [t for t in tabs if (t["stage"] or "todo") == stage]
+        if not group:
+            continue
+        print(color(f"{title} ({len(group)})", "bold"))
+        for t in group:
+            win = str(t["window"]) if t["window"] is not None else "-"
+            mark = color("●", t["status"]) if t["status"] == "busy" else " "
+            print(f"  {color(win.rjust(3), 'dim')}  "
+                  f"{(t['window_name'] or t['name']).ljust(20)} {mark} "
+                  f"{t['goal'] or color(tilde(t['cwd']), 'dim')}")
+            tail = []
+            if t["blocked_by"]:
+                tail.append(f"blocked: {t['blocked_by']}")
+            if t["next"]:
+                tail.append(f"next: {t['next']}")
+            if t["queued"]:
+                tail.append(f"queued: {t['queued']}")
+            if tail:
+                print(color("       " + " | ".join(tail), "dim"))
+        print()
+
+
+def cmd_set(argv):
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    if not sid:
+        sys.exit("abujarvis set: no CLAUDE_CODE_SESSION_ID — run this inside a Claude tab")
+    patch = {}
+    i = 0
+    while i < len(argv):
+        key = argv[i].lstrip("-")
+        if key not in ("goal", "stage", "next", "blocked"):
+            sys.exit(f"abujarvis set: unknown flag '{argv[i]}'")
+        if i + 1 >= len(argv):
+            sys.exit(f"abujarvis set: --{key} needs a value")
+        val = argv[i + 1]
+        if key == "stage" and val not in STAGES:
+            sys.exit(f"abujarvis set: stage '{val}' not one of {'/'.join(STAGES)}")
+        patch["blocked_by" if key == "blocked" else key] = val
+        i += 2
+    if not patch:
+        sys.exit("abujarvis set: nothing to change")
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    path = os.path.join(STATE, f"{sid}.json")
+    card = read_card(sid)
+    card.update(patch)
+    card["session_id"] = sid
+    card["updated"] = int(time.time())
+    stage = patch.get("stage")
+    if stage and stage != "blocked" and "blocked_by" not in patch:
+        card.pop("blocked_by", None)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(card, f, ensure_ascii=False)
+    os.replace(tmp, path)
+    print("card updated: " + ", ".join(f"{k}={v}" for k, v in patch.items()))
+
+
+def cmd_assign(argv):
+    if len(argv) < 2:
+        sys.exit('abujarvis assign: usage: abujarvis assign <tab> "task"')
+    tabs = agents()
+    t = resolve(tabs, argv[0])
+    task = " ".join(argv[1:])
+    os.makedirs(INBOX, mode=0o700, exist_ok=True)
+    with open(os.path.join(INBOX, f"{t['session_id']}.jsonl"), "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        f.write(json.dumps({"task": task, "from": "abujarvis", "at": int(time.time())},
+                           ensure_ascii=False) + "\n")
+        fcntl.flock(f, fcntl.LOCK_UN)
+    where = f"window {t['window']}" if t["window"] is not None else t["name"]
+    n = inbox_count(t["session_id"])
+    when = "will pick it up when it finishes" if t["status"] == "busy" else "picks it up next"
+    print(f"→ {t['window_name'] or t['name']} ({where}): {n} queued, {when}")
+
+
+def cmd_card(argv):
+    tabs = agents()
+    print(json.dumps(resolve(tabs, argv[0] if argv else None), ensure_ascii=False, indent=2))
+
+
+def cmd_chat(argv):
+    if not os.path.isdir(ROOT):
+        sys.exit(f"abujarvis: no working dir {ROOT} — run install.sh first")
+    os.chdir(ROOT)
+    os.execv(CLAUDE, [CLAUDE, *argv])
+
+
+def cmd_jump(argv):
+    tabs = agents()
+    t = resolve(tabs, argv[0] if argv else None)
+    if t["window"] is None:
+        sys.exit(f"abujarvis: tab '{t['name']}' has no tmux window")
+    subprocess.run(["tmux", "select-window", "-t", f"{SESSION}:{t['window']}"])
+    if not os.environ.get("TMUX"):
+        subprocess.run(["tmux", "attach-session", "-t", SESSION])
+
+
+USAGE = """abujarvis — a manager for your Claude Code tabs
+
+  abujarvis chat                  talk to Abu Jarvis (Claude with a manager role)
+  abujarvis ls [--json]           every tab: window, status, project
+  abujarvis board                 kanban by stage
+  abujarvis jump <tab>            switch to a tab (window number, name, or path)
+  abujarvis assign <tab> "task"   queue a task — the tab takes it when it is free
+  abujarvis card <tab>            full card for one tab
+
+from inside a tab (this is how an agent reports on itself):
+  abujarvis set --goal "..." --stage <todo|doing|review|blocked|done>
+                [--next "..."] [--blocked "..."]
+
+env: ABUJARVIS_SESSION (tmux session, default "dev"), ABUJARVIS_HOME (default ~/.abujarvis)
+"""
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(USAGE)
+        return
+    cmd, rest = argv[0], argv[1:]
+    table = {"ls": cmd_ls, "board": cmd_board, "jump": cmd_jump, "chat": cmd_chat,
+             "set": cmd_set, "assign": cmd_assign, "card": cmd_card}
+    if cmd not in table:
+        sys.exit(f"abujarvis: unknown command '{cmd}'\n\n{USAGE}")
+    table[cmd](rest)
+
+
+if __name__ == "__main__":
+    main()
