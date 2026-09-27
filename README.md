@@ -1,6 +1,7 @@
 # Abu Jarvis
 
-A manager for a fleet of **long-lived** Claude Code tabs.
+A dispatcher for a fleet of Claude Code tabs — the long-lived ones you work in, and short
+slice tabs for code.
 
 You have a tmux session with a dozen Claude Code instances — one per project, one per area of
 your life. Abu Jarvis sees what each of them is doing, hands out tasks, and shows you a board.
@@ -24,21 +25,28 @@ NO TASK (12)
 
 ## Why this exists
 
-Most tools in this space (claude-squad, vibe-kanban, kanban-code…) assume **task → new git
-worktree → fresh agent → PR**. That is a great model for shipping features, and if it fits you,
-use one of those — they are more mature.
+Two shapes of work live in the same tmux session, and Abu Jarvis is built for both.
 
-Abu Jarvis is for the other shape: tabs that **already exist and outlive any single task**.
-Some of them aren't even code — notes, study, journaling. You don't spawn them per task; they
-are just where you work.
+**Long-lived tabs.** Tabs that **already exist and outlive any single task** — a project you live
+in, notes, study, journaling. You don't spawn them per task; they are just where you work.
 
-Two design choices follow from that, and they are the whole point:
+**Slice tabs** *(planned, [#2](https://github.com/A-Levin/abujarvis/issues/2))*. For code, one
+long session per feature gets expensive: every turn re-reads the whole context. On a real
+project, long feature sessions averaged **370–410k** context tokens per turn; the same work cut
+into slices — one repo, one chain of TDD steps, one PR per session — ran at **70–130k**. So for
+code, Jarvis opens a fresh short tab per slice instead of feeding the task to an old one.
+
+Tools like claude-squad, vibe-kanban and kanban-code also do **task → fresh agent → PR**, and
+they are more mature. What Abu Jarvis is about:
 
 - **It never interrupts a tab.** Tasks go into a queue. A tab picks one up only when it has
   finished what it was doing and is about to stop. (Other tools deliver work with
   `tmux send-keys`, which types into the agent mid-thought.)
 - **It never guesses.** State comes from `claude agents --json`, the official interface, not from
   scraping the ANSI output of a terminal.
+- **It watches the economy** *(planned)*. Context size on every card, idle tabs, spend per day
+  ([#3](https://github.com/A-Levin/abujarvis/issues/3), [#4](https://github.com/A-Levin/abujarvis/issues/4)),
+  and the next slice queued into a new tab when a PR merges ([#5](https://github.com/A-Levin/abujarvis/issues/5)).
 
 ## Install
 
@@ -86,9 +94,9 @@ The identifier is `sessionId`, not pid: a pid dies when a tab restarts, a sessio
 
 ### Why a queue instead of just typing into the tab
 
-You **cannot** programmatically inject a prompt into a live interactive Claude Code process —
-`claude --resume` spawns a *new* one. So the only correct channel is to let the tab come get the
-work itself:
+There are direct channels now — Claude Code sessions can message each other, Codex has
+`codex queue` — but they solve delivery, not timing. Abu Jarvis cares about timing: a tab takes
+the next task only after it has finished the current one. The `Stop` hook is exactly that moment:
 
 1. `abujarvis assign` appends to the tab's inbox (under `flock`).
 2. The tab finishes, is about to stop, and the `Stop` hook fires.
@@ -162,8 +170,19 @@ session dies in that window, the task is gone from the queue without having been
 
 Working: tab registry, cards, kanban in the terminal, task queue, the manager you can talk to.
 
-Not built yet: a TUI/web board, and the "full orchestrator" role (creating and killing tabs,
-making worktrees, restarting stuck tabs) — that one touches your live session, so it waits.
+Planned, one issue per slice:
+
+1. `aj new <feature> <repo>` — a fresh tab per slice; the card tracks the TDD step from git ([#2](https://github.com/A-Levin/abujarvis/issues/2))
+2. Context size on the card, `aj spend` ([#3](https://github.com/A-Levin/abujarvis/issues/3))
+3. Idle tabs, subagents inside tabs ([#4](https://github.com/A-Levin/abujarvis/issues/4))
+4. Next slice queued on PR merge ([#5](https://github.com/A-Levin/abujarvis/issues/5))
+5. Codex as a second engine ([#6](https://github.com/A-Levin/abujarvis/issues/6))
+
+Creating tabs is no longer postponed: `aj new` only ever opens a *new* window and never types
+into a running one. Killing tabs and restarting stuck ones still wait — they touch your live
+session.
+
+Not built yet: a TUI/web board.
 
 ## Configuration
 
